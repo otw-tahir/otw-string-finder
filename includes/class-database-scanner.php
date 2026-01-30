@@ -15,14 +15,14 @@ if (!defined('ABSPATH')) {
 class Database_Scanner {
     
     /**
-     * Batch size for database rows (reduced for memory safety)
+     * Batch size for database rows (very small for memory safety)
      */
-    private $batch_size = 100;
+    private $batch_size = 10;
     
     /**
      * Max results per batch to prevent memory issues
      */
-    private $max_results_per_batch = 500;
+    private $max_results_per_batch = 50;
     
     /**
      * Max execution time (in seconds)
@@ -53,7 +53,7 @@ class Database_Scanner {
      * Constructor
      */
     public function __construct() {
-        $this->batch_size = get_option('otw_sf_batch_size_db', 100);
+        $this->batch_size = get_option('otw_sf_batch_size_db', 50);
         $this->max_execution_time = get_option('otw_sf_max_execution_time', 25);
         $this->start_time = microtime(true);
         $this->set_memory_limit();
@@ -256,49 +256,73 @@ class Database_Scanner {
             $table_name = $table['name'];
             $primary_key = $table['primary_key'];
             
-            // Build column list for SELECT
-            $columns_to_select = $table['columns'];
-            if ($primary_key && !in_array($primary_key, $columns_to_select)) {
-                array_unshift($columns_to_select, $primary_key);
+            // If table has no primary key, skip it (we can't safely paginate)
+            if (!$primary_key) {
+                $current_table_index++;
+                $current_offset = 0;
+                continue;
             }
             
-            $columns_sql = implode('`, `', $columns_to_select);
-            
-            // Fetch batch of rows
-            $rows = $wpdb->get_results(
+            // First, just get the primary keys for this batch (lightweight query)
+            $pk_rows = $wpdb->get_results(
                 $wpdb->prepare(
-                    "SELECT `{$columns_sql}` FROM `{$table_name}` LIMIT %d OFFSET %d",
+                    "SELECT `{$primary_key}` FROM `{$table_name}` LIMIT %d OFFSET %d",
                     $this->batch_size,
                     $current_offset
                 ),
                 ARRAY_A
             );
             
-            if (empty($rows)) {
+            if (empty($pk_rows)) {
                 // Move to next table
                 $current_table_index++;
                 $current_offset = 0;
                 continue;
             }
             
-            // Search through rows
-            foreach ($rows as $row) {
-                if ($this->should_stop()) {
+            // Store row count before processing (for offset calculation)
+            $fetched_rows_count = count($pk_rows);
+            
+            // Process each row individually to control memory
+            foreach ($pk_rows as $pk_row) {
+                if ($this->should_stop() || count($batch_results) >= $this->max_results_per_batch) {
                     break;
                 }
                 
-                $primary_value = $primary_key ? $row[$primary_key] : null;
+                $primary_value = $pk_row[$primary_key];
                 
+                // Fetch each column separately for this row
                 foreach ($table['columns'] as $column) {
-                    if (!isset($row[$column]) || empty($row[$column])) {
+                    if ($this->should_stop() || count($batch_results) >= $this->max_results_per_batch) {
+                        break;
+                    }
+                    
+                    // Get just this one column value
+                    $value = $wpdb->get_var($wpdb->prepare(
+                        "SELECT `{$column}` FROM `{$table_name}` WHERE `{$primary_key}` = %s LIMIT 1",
+                        $primary_value
+                    ));
+                    
+                    if (empty($value)) {
                         continue;
                     }
                     
-                    $value = $row[$column];
+                    // Skip very large values (> 500KB) to prevent memory issues
+                    if (strlen($value) > 524288) {
+                        continue;
+                    }
+                    
                     $matches = $this->search_value($value, $session['search_string'], $session['is_regex']);
                     
+                    // Free the value immediately
+                    unset($value);
+                    
                     if (!empty($matches)) {
+                        // Limit matches per column to prevent explosion
+                        $match_count = 0;
                         foreach ($matches as $match) {
+                            if ($match_count >= 3) break; // Max 3 matches per cell
+                            
                             $batch_results[] = [
                                 'type' => 'database',
                                 'table' => $table_name,
@@ -311,7 +335,9 @@ class Database_Scanner {
                                 'path' => $match['path'] ?? '',
                                 'edit_url' => $this->get_edit_url($table_name, $column, $primary_key, $primary_value),
                             ];
+                            $match_count++;
                         }
+                        unset($matches);
                     }
                 }
                 
@@ -319,10 +345,13 @@ class Database_Scanner {
                 $session['processed_rows']++;
             }
             
-            $current_offset += count($rows);
+            // Free memory
+            unset($pk_rows);
+            
+            $current_offset += $fetched_rows_count;
             
             // Check if we've processed all rows in this table
-            if (count($rows) < $this->batch_size) {
+            if ($fetched_rows_count < $this->batch_size) {
                 $current_table_index++;
                 $current_offset = 0;
             }

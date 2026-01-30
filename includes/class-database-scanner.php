@@ -15,9 +15,14 @@ if (!defined('ABSPATH')) {
 class Database_Scanner {
     
     /**
-     * Batch size for database rows
+     * Batch size for database rows (reduced for memory safety)
      */
-    private $batch_size = 500;
+    private $batch_size = 100;
+    
+    /**
+     * Max results per batch to prevent memory issues
+     */
+    private $max_results_per_batch = 500;
     
     /**
      * Max execution time (in seconds)
@@ -48,7 +53,7 @@ class Database_Scanner {
      * Constructor
      */
     public function __construct() {
-        $this->batch_size = get_option('otw_sf_batch_size_db', 500);
+        $this->batch_size = get_option('otw_sf_batch_size_db', 100);
         $this->max_execution_time = get_option('otw_sf_max_execution_time', 25);
         $this->start_time = microtime(true);
         $this->set_memory_limit();
@@ -242,6 +247,11 @@ class Database_Scanner {
         $current_offset = $session['current_row_offset'];
         
         while (!$this->should_stop() && $current_table_index < count($session['tables'])) {
+            // Also stop if we have too many results in this batch
+            if (count($batch_results) >= $this->max_results_per_batch) {
+                break;
+            }
+            
             $table = $session['tables'][$current_table_index];
             $table_name = $table['name'];
             $primary_key = $table['primary_key'];
@@ -322,11 +332,17 @@ class Database_Scanner {
         $session['current_table_index'] = $current_table_index;
         $session['current_row_offset'] = $current_offset;
         
-        // Store batch results
+        // Store batch results in chunks to avoid memory issues
         if (!empty($batch_results)) {
-            $existing_results = get_transient('otw_sf_db_results_' . $search_id) ?: [];
-            $all_results = array_merge($existing_results, $batch_results);
-            set_transient('otw_sf_db_results_' . $search_id, $all_results, HOUR_IN_SECONDS);
+            // Get current result chunk index
+            $result_chunk_index = isset($session['result_chunk_index']) ? $session['result_chunk_index'] : 0;
+            
+            // Store this batch as a new chunk
+            set_transient('otw_sf_db_results_' . $search_id . '_' . $result_chunk_index, $batch_results, HOUR_IN_SECONDS);
+            
+            // Update chunk index and total count
+            $session['result_chunk_index'] = $result_chunk_index + 1;
+            $session['total_results'] = ($session['total_results'] ?? 0) + count($batch_results);
         }
         
         // Check if completed
@@ -342,6 +358,7 @@ class Database_Scanner {
             'status' => $session['status'],
             'total_rows' => $session['total_rows'],
             'processed_rows' => $session['processed_rows'],
+            'total_results' => $session['total_results'] ?? 0,
             'current_table' => isset($session['tables'][$current_table_index]) 
                 ? $session['tables'][$current_table_index]['name'] 
                 : 'completed',
@@ -471,18 +488,40 @@ class Database_Scanner {
     }
     
     /**
-     * Get all results for a search
+     * Get all results for a search (collected from all chunks)
      */
     public function get_results($search_id) {
-        return get_transient('otw_sf_db_results_' . $search_id) ?: [];
+        $session = get_transient('otw_sf_db_session_' . $search_id);
+        $all_results = [];
+        
+        if ($session && isset($session['result_chunk_index'])) {
+            $chunk_count = $session['result_chunk_index'];
+            for ($i = 0; $i < $chunk_count; $i++) {
+                $chunk_results = get_transient('otw_sf_db_results_' . $search_id . '_' . $i);
+                if ($chunk_results) {
+                    $all_results = array_merge($all_results, $chunk_results);
+                }
+            }
+        }
+        
+        return $all_results;
     }
     
     /**
      * Clean up a search session
      */
     public function cleanup_search($search_id) {
+        $session = get_transient('otw_sf_db_session_' . $search_id);
+        
+        // Clean up all result chunks
+        if ($session && isset($session['result_chunk_index'])) {
+            $chunk_count = $session['result_chunk_index'];
+            for ($i = 0; $i < $chunk_count; $i++) {
+                delete_transient('otw_sf_db_results_' . $search_id . '_' . $i);
+            }
+        }
+        
         delete_transient('otw_sf_db_session_' . $search_id);
-        delete_transient('otw_sf_db_results_' . $search_id);
     }
     
     /**
